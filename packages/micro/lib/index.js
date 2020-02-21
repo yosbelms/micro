@@ -104,27 +104,6 @@ exports.send = send;
 exports.sendError = sendError;
 exports.createError = createError;
 
-exports.run = (req, res, fn) =>
-	new Promise(resolve => resolve(fn(req, res)))
-		.then(val => {
-			if (val === null) {
-				send(res, 204, null);
-				return;
-			}
-
-			// Send value if it is not undefined, otherwise assume res.end
-			// will be called later
-			// eslint-disable-next-line no-undefined
-			if (val !== undefined) {
-				send(res, res.statusCode || 200, val);
-			}
-		})
-		.catch(err => sendError(req, res, err));
-
-// Maps requests to buffered raw bodies so that
-// multiple calls to `json` work as expected
-const rawBodyMap = new WeakMap();
-
 const parseJSON = str => {
 	try {
 		return JSON.parse(str);
@@ -133,8 +112,39 @@ const parseJSON = str => {
 	}
 };
 
-exports.buffer = (req, {limit = '1mb', encoding} = {}) =>
-	Promise.resolve().then(() => {
+// Maps requests to buffered raw bodies so that
+// multiple calls to `json` work as expected
+const rawBodyMap = new WeakMap();
+
+exports.run = (req, res, fn) => {
+	const clearRawBodyMap = () => rawBodyMap.delete(req);
+	res.on('finish', clearRawBodyMap);
+	res.on('close', clearRawBodyMap);
+
+	return Promise.resolve(fn(req, res)).then(val => {
+		if (val === null) {
+			send(res, 204, null);
+			return;
+		}
+
+		// Send value if it is not undefined, otherwise assume res.end
+		// will be called later
+		// eslint-disable-next-line no-undefined
+		if (val !== undefined) {
+			send(res, res.statusCode || 200, val);
+		}
+	})
+		.catch(err => sendError(req, res, err));
+};
+
+exports.buffer = (req, {limit = '1mb', encoding, parse = a => a} = {}) => (
+	new Promise((resolve, reject) => {
+		const body = rawBodyMap.get(req);
+		if (body) {
+			resolve(parse(body));
+			return;
+		}
+
 		const type = req.headers['content-type'] || 'text/plain';
 		const length = req.headers['content-length'];
 
@@ -143,28 +153,25 @@ exports.buffer = (req, {limit = '1mb', encoding} = {}) =>
 			encoding = contentType.parse(type).parameters.charset;
 		}
 
-		const body = rawBodyMap.get(req);
-
-		if (body) {
-			return body;
-		}
-
-		return getRawBody(req, {limit, length, encoding})
-			.then(buf => {
-				rawBodyMap.set(req, buf);
-				return buf;
-			})
-			.catch(err => {
+		getRawBody(req, {limit, length, encoding}, (err, buf) => {
+			if (err) {
+				let reason;
 				if (err.type === 'entity.too.large') {
-					throw createError(413, `Body exceeded ${limit} limit`, err);
+					reason = createError(413, `Body exceeded ${limit} limit`, err);
 				} else {
-					throw createError(400, 'Invalid body', err);
+					reason = createError(400, 'Invalid body', err);
 				}
-			});
-	});
+				reject(reason);
+				return;
+			}
+			rawBodyMap.set(req, buf);
+			return parse(buf);
+		});
+	})
+);
 
 exports.text = (req, {limit, encoding} = {}) =>
-	exports.buffer(req, {limit, encoding}).then(body => body.toString(encoding));
+	exports.buffer(req, {limit, encoding, parse: body => body.toString(encoding)});
 
-exports.json = (req, opts) =>
-	exports.text(req, opts).then(body => parseJSON(body));
+exports.json = (req, {limit, encoding} = {}) =>
+	exports.text(req, {limit, encoding, parseJSON});

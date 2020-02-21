@@ -194,10 +194,11 @@ test('return <null>', async t => {
 });
 
 test('return <null> calls res.end once', async t => {
-	const fn = async () => null;
-
 	let i = 0;
-	await micro.run({}, {end: () => i++}, fn);
+	const fn = async () => null;
+	const res = {end: () => i++, setHeader: () => {}, on: () => {}};
+
+	await micro.run({}, res, fn);
 
 	t.is(i, 1);
 });
